@@ -19,10 +19,20 @@ wasteful in a polling loop.
 observe_device_light never enumerates installed apps and never returns the
 full hierarchy. It returns CapturedAt, CurrentPackage and, when asked, a
 bounded set of nodes filtered by text/description/resource-id.
+
+Screenshots: inline base64 is expensive (a q50 shot is ~255 KB -> ~340 KB of
+base64 text, which is a lot of model context per poll). Pass
+`screenshot_save_path` instead and the JPEG is written to a file on the device
+and the response carries only `ScreenshotPath` + `ScreenshotBytes`. The
+directory is pruned automatically (keep-newest count and max age), so shots
+cannot accumulate and fill the device. Pull the file to the PC with
+`extensions/pull_screenshots.py`, then delete it on the device.
 """
 
 import base64
 import json
+import os
+import time
 import xml.etree.ElementTree as ET
 from datetime import datetime
 from io import BytesIO
@@ -42,13 +52,15 @@ class ObserveLightMcpExtension(BaseMcpExtension):
 
     route = "/observe-light/mcp/"
     name = "observe-light"
-    version = "1.0"
+    version = "1.1"
 
     @mcp("tool", description=(
         "Lightweight device observation. Returns CapturedAt, CurrentPackage "
         "and optionally a bounded, filtered set of UI nodes. Never enumerates "
         "installed apps and never returns the full hierarchy. Use this for "
-        "polling; use observeDevice when you need the complete state."
+        "polling; use observeDevice when you need the complete state. For "
+        "screenshots prefer screenshot_save_path (written on the device, "
+        "auto-pruned) over inline base64: it keeps the response tiny."
     ))
     def observe_device_light(
         self,
@@ -58,7 +70,11 @@ class ObserveLightMcpExtension(BaseMcpExtension):
         node_patterns: Annotated[str, "Comma-separated substrings matched against text and content-desc."] = "",
         resource_ids: Annotated[str, "Comma-separated exact resource-id values to keep."] = "",
         max_nodes: Annotated[int, "Maximum nodes to return. 0 disables node output."] = 30,
-        screenshot: Annotated[bool, "Include a JPEG screenshot as base64."] = False,
+        screenshot: Annotated[bool, "Include a screenshot. Implied when screenshot_save_path is set."] = False,
+        screenshot_save_path: Annotated[str, "Device path for the JPEG. Trailing '/' or an existing dir auto-names shot_<ts>.jpg; '{ts}' expands to a ms timestamp. When set, base64 is omitted."] = "",
+        screenshot_inline: Annotated[bool, "With screenshot_save_path, also inline base64 (rarely wanted)."] = False,
+        screenshot_keep: Annotated[int, "When saving, keep at most this many shots in the directory; older ones are deleted. 0 disables the count limit."] = 5,
+        screenshot_max_age: Annotated[int, "When saving, delete shots older than this many seconds. 0 disables the age limit."] = 600,
         screenshot_quality: Annotated[int, "JPEG quality when screenshot is enabled."] = 50,
         screenshot_scale: Annotated[float, "Optional downscale factor for the screenshot."] = 1.0,
         screenshot_bound: Annotated[str, "Optional crop region as top,left,right,bottom."] = "",
@@ -106,7 +122,8 @@ class ObserveLightMcpExtension(BaseMcpExtension):
             if error:
                 payload["HierarchyError"] = error
 
-        if screenshot:
+        save_path = str(screenshot_save_path).strip()
+        if screenshot or save_path:
             try:
                 bound = self._parse_bound(screenshot_bound)
                 image_data = target.screenshot(int(screenshot_quality), bound=bound).getvalue()
@@ -122,11 +139,91 @@ class ObserveLightMcpExtension(BaseMcpExtension):
                         image_data = buf.getvalue()
                 payload["ScreenshotFormat"] = "jpeg"
                 payload["ScreenshotBytes"] = len(image_data)
-                payload["ScreenshotBase64"] = base64.b64encode(image_data).decode("ascii")
+                if save_path:
+                    # Write on the device and return only the path: a JPEG is
+                    # far too large to inline into model context on every poll.
+                    try:
+                        keep = int(screenshot_keep)
+                    except (TypeError, ValueError):
+                        keep = 5
+                    try:
+                        max_age = int(screenshot_max_age)
+                    except (TypeError, ValueError):
+                        max_age = 600
+                    saved = self._write_screenshot(save_path, image_data,
+                                                   keep=keep, max_age=max_age)
+                    payload["ScreenshotPath"] = saved["path"]
+                    payload["ScreenshotPruned"] = saved["pruned"]
+                    payload["ScreenshotDirCount"] = saved["count"]
+                    payload["ScreenshotBase64Included"] = False
+                    if screenshot_inline:
+                        payload["ScreenshotBase64"] = base64.b64encode(image_data).decode("ascii")
+                        payload["ScreenshotBase64Included"] = True
+                else:
+                    payload["ScreenshotBase64"] = base64.b64encode(image_data).decode("ascii")
+                    payload["ScreenshotBase64Included"] = True
             except Exception as exc:  # noqa: BLE001
                 payload["ScreenshotError"] = "{0}: {1}".format(type(exc).__name__, exc)
 
         return TextContent(text=json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
+
+    def _write_screenshot(self, path, image_data, keep=5, max_age=600):
+        """Write JPEG bytes to a device path, then prune the directory.
+
+        Accepts a file path, a directory (trailing '/' or an existing dir), or
+        a path containing '{ts}'; the last two get a timestamped filename.
+
+        Retention matters: these shots accumulate at ~250 KB each and the
+        device is not the storage owner. After every write the containing
+        directory is trimmed to the newest `keep` *.jpg files and anything
+        older than `max_age` seconds is removed. PC-side
+        pull_screenshots.py then copies files off and deletes them.
+        """
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
+        path = path.replace("{ts}", stamp)
+        if path.endswith("/") or os.path.isdir(path):
+            os.makedirs(path, exist_ok=True)
+            path = os.path.join(path, "shot_{0}.jpg".format(stamp))
+        parent = os.path.dirname(path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        with open(path, "wb") as fd:
+            fd.write(image_data)
+        pruned, count = self._prune_shots(parent, keep=keep, max_age=max_age)
+        return {"path": path, "pruned": pruned, "count": count}
+
+    def _prune_shots(self, directory, keep=5, max_age=600):
+        """Trim `directory` to the newest `keep` jpg files / `max_age` seconds."""
+        if not directory or not os.path.isdir(directory):
+            return 0, 0
+        shots = []
+        try:
+            for name in os.listdir(directory):
+                if not name.lower().endswith((".jpg", ".jpeg")):
+                    continue
+                full = os.path.join(directory, name)
+                try:
+                    shots.append((os.path.getmtime(full), full))
+                except OSError:
+                    continue
+        except OSError:
+            return 0, 0
+        shots.sort(reverse=True)
+        now = time.time()
+        pruned = 0
+        keep = max(0, int(keep))
+        max_age = max(0, int(max_age))
+        for index, (mtime, full) in enumerate(shots):
+            too_many = keep > 0 and index >= keep
+            too_old = max_age > 0 and (now - mtime) > max_age
+            if not (too_many or too_old):
+                continue
+            try:
+                os.remove(full)
+                pruned += 1
+            except OSError:
+                continue
+        return pruned, len(shots) - pruned
 
     def _current_package(self, target):
         try:
